@@ -1,0 +1,288 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+import sqlite3
+import pandas as pd
+from datetime import datetime
+
+
+# In[2]:
+
+
+# Chargement des CSV locaux
+df_produits = pd.read_csv('produits.csv')
+df_magasins = pd.read_csv('magasins.csv')
+df_ventes = pd.read_csv('ventes.csv')
+
+
+# In[3]:
+
+
+# Renommage de toutes les colonnes
+df_produits.columns = ['nom_produit', 'id_produit', 'prix_produit', 'stock_produit']
+# Renommage de toutes les colonnes
+df_magasins.columns = ['id_magasin', 'ville_magasin', 'nbrSalarie_magasin']
+# Renommage de toutes les colonnes
+df_ventes.columns = ['date_vente', 'id_reference_produit', 'quantite_vente', 'id_magasin']
+
+
+# ### 2- Connexion à SQLite
+
+# In[4]:
+
+
+conn = sqlite3.connect("data/ventes_pme.db")
+cur = conn.cursor()
+
+
+# In[5]:
+
+
+cur.execute("DROP TABLE IF EXISTS ventesCUR")
+cur.execute("DROP TABLE IF EXISTS produitsCUR")
+cur.execute("DROP TABLE IF EXISTS magasinsCUR")
+cur.execute("DROP TABLE IF EXISTS resultats_analyse")
+
+
+# In[6]:
+
+
+# Création des tables
+
+cur.executescript("""
+CREATE TABLE IF NOT EXISTS produitsCUR (
+    id_produit TEXT PRIMARY KEY, 
+    nom_produit TEXT,
+    catégorie TEXT,
+    prix_unitaire REAL
+);
+
+CREATE TABLE IF NOT EXISTS magasinsCUR (
+    id_magasin INTEGER PRIMARY KEY,
+    nom_magasin TEXT,
+    ville TEXT,
+    region TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ventesCUR (
+    id_vente INTEGER PRIMARY KEY AUTOINCREMENT,
+    date_vente TEXT,
+    id_produit TEXT,
+    quantite INTEGER,
+    id_magasin INTEGER,
+    montant_total REAL,
+    UNIQUE(date_vente, id_produit, id_magasin)
+);
+
+CREATE TABLE IF NOT EXISTS résultats_analyse (
+    id_resultat INTEGER PRIMARY KEY AUTOINCREMENT,
+    date_analyse TEXT,
+    indicateur TEXT,
+    valeur TEXT
+);
+""")
+
+
+# In[7]:
+
+
+cursor = conn.cursor()
+cursor.execute("PRAGMA table_info(produits)")
+for row in cursor.fetchall():
+    print(row)
+
+
+# In[8]:
+
+
+cursor.execute("DROP TABLE IF EXISTS produits")
+conn.commit()
+
+
+# In[9]:
+
+
+# Insertion des produits
+df_produits.to_sql("produitsCUR", conn, if_exists='replace', index=False)
+
+# Insertion des magasins
+df_magasins.to_sql("magasinsCUR", conn, if_exists='replace', index=False)
+
+# Insertion des ventes
+df_ventes.to_sql("ventesCUR", conn, if_exists='replace', index=False)
+
+
+# In[10]:
+
+
+df_ventes.columns = df_ventes.columns.str.strip()  
+print(df_ventes.columns)  
+
+
+# In[11]:
+
+
+print(df_ventes.columns.tolist())
+
+
+# In[12]:
+
+
+cur.execute("PRAGMA table_info(ventesCUR)")
+print(cur.fetchall())
+
+
+# In[13]:
+
+
+cur.execute("DROP TABLE IF EXISTS ventesCUR")
+
+cur.execute("""
+CREATE TABLE ventesCUR (
+    id_vente INTEGER PRIMARY KEY AUTOINCREMENT,
+    date_vente TEXT,
+    id_produit TEXT,
+    quantite INTEGER,
+    id_magasin INTEGER,
+    montant_total REAL,
+    UNIQUE(date_vente, id_produit, id_magasin)
+)
+""")
+
+
+# In[14]:
+
+
+for _, vente in df_ventes.iterrows():
+  
+    date_vente = vente['date_vente']
+    ref_produit = vente['id_reference_produit'] 
+    quantite = vente['quantite_vente']
+    id_magasin = vente['id_magasin']
+
+    cur.execute("SELECT prix_produit FROM produitsCUR WHERE id_produit = ?", (ref_produit,))
+    res = cur.fetchone()
+
+    if res:
+        prix = res[0]
+        montant_total = quantite * prix
+
+        try:
+            cur.execute("""
+                INSERT INTO ventesCUR (date_vente, id_produit, quantite, id_magasin, montant_total)
+                VALUES (?, ?, ?, ?, ?)
+            """, (date_vente, ref_produit, quantite, id_magasin, montant_total))
+        except sqlite3.IntegrityError:
+            continue  # doublon ignoré
+
+
+# In[15]:
+
+
+# Analyse 1 : Chiffre d’affaires total
+cur.execute("SELECT SUM(montant_total) FROM ventesCUR")
+total_ca = cur.fetchone()[0]
+cur.execute("""
+    INSERT INTO résultats_analyse (date_analyse, indicateur, valeur)
+    VALUES (?, ?, ?)
+""", (datetime.now().isoformat(), "chiffre_affaires_total", str(total_ca)))
+
+
+# In[16]:
+
+
+# Analyse 2 : Ventes par produit
+df_ventes_produit = pd.read_sql_query("""
+    SELECT produitsCUR.nom_produit, SUM(ventesCUR.quantite) AS total_vendu
+    FROM ventesCUR
+    JOIN produitsCUR ON ventesCUR.id_produit = produitsCUR.id_produit
+    GROUP BY produitsCUR.nom_produit
+""", conn)
+
+cur.execute("""
+    INSERT INTO résultats_analyse (date_analyse, indicateur, valeur)
+    VALUES (?, ?, ?)
+""", (datetime.now().isoformat(), "ventes_par_produit", df_ventes_produit.to_json()))
+
+
+# In[17]:
+
+
+cur.execute("PRAGMA table_info(magasinsCUR)")
+print(cur.fetchall())
+
+
+# In[18]:
+
+
+cur.execute("DROP TABLE IF EXISTS magasinsCUR")
+cur.execute("""CREATE TABLE IF NOT EXISTS magasinsCUR (
+    id_magasin INTEGER PRIMARY KEY,
+    nom_magasin TEXT,
+    ville TEXT,
+    region TEXT
+)
+""")
+
+
+# In[19]:
+
+
+# Analyse 3 : Ventes par région
+df_ventes_region = pd.read_sql_query("""
+    SELECT magasinsCUR.region, SUM(ventesCUR.montant_total) AS total_region
+    FROM ventesCUR
+    JOIN magasinsCUR ON ventesCUR.id_magasin = magasinsCUR.id_magasin
+    GROUP BY magasinsCUR.region
+""", conn)
+
+cur.execute("""
+    INSERT INTO résultats_analyse (date_analyse, indicateur, valeur)
+    VALUES (?, ?, ?)
+""", (datetime.now().isoformat(), "ventes_par_region", df_ventes_region.to_json()))
+
+
+# In[20]:
+
+
+# Commit & Close
+conn.commit()
+conn.close()
+
+print(" Données insérées et analyses enregistrées avec succès !")
+
+
+# In[ ]:
+
+
+
+
+--------------------
+version: "3.8"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: python_app
+    volumes:
+      - .:/usr/src/app
+    working_dir: /usr/src/app
+    command: ["python", "main.py"]
+    tty: true
+    stdin_open: true
+--------------------
+FROM python:3
+
+WORKDIR /usr/src/app
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD [ "python", "main.py"]
